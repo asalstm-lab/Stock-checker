@@ -37,74 +37,175 @@ INDUSTRY_DRIVERS = {
 
 
 # ------------------------------------------------------------------ data layer
-def _retry(fn, tries=3, delay=1.5):
+PEER_FALLBACK = {
+    "refin": ["VLO", "PSX", "DINO", "PBF", "DK", "PARR"],
+    "airline": ["DAL", "UAL", "AAL", "LUV", "JBLU"],
+    "semiconductor equipment": ["ASML", "AMAT", "LRCX", "KLAC"],
+    "semiconductor": ["NVDA", "AMD", "TSM", "MU", "AVGO", "INTC"],
+    "solar": ["ENPH", "RUN", "NXT", "CSIQ", "SEDG"],
+}
+
+
+def _log(key, e):
+    """Remember the last error per data source so the Diagnostics box can show it."""
+    try:
+        st.session_state.setdefault("diag", {})[key] = f"{type(e).__name__}: {str(e)[:240]}"
+    except Exception:
+        pass
+
+
+def _safe(fn, *args, default=None, tries=2, key=None):
+    """Call a cached fetcher. Fetchers RAISE on failure so failures are never cached."""
     for i in range(tries):
         try:
-            return fn()
-        except Exception:
-            time.sleep(delay * (i + 1))
-    return None
+            return fn(*args)
+        except Exception as e:
+            _log(key or getattr(fn, "__name__", "call"), e)
+            if i < tries - 1:
+                time.sleep(1.2 * (i + 1))
+    return default
+
+
+def _slug(text):
+    words = "".join(ch if ch.isalnum() else " " for ch in (text or "").lower()).split()
+    return "-".join(words)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
+def _search_raw(query):
+    res = yf.Search(query, max_results=10).quotes
+    if not res:
+        raise RuntimeError("no search results")
+    return res
+
+
 def search_symbols(query):
-    res = _retry(lambda: yf.Search(query, max_results=10).quotes) or []
+    res = _safe(_search_raw, query, default=[], key="search")
     out = []
     for r in res:
         if r.get("quoteType") == "EQUITY" and r.get("symbol"):
             out.append({"symbol": r["symbol"],
                         "name": r.get("longname") or r.get("shortname") or r["symbol"],
-                        "exch": r.get("exchDisp", "")})
+                        "exch": r.get("exchDisp", ""),
+                        "sector": r.get("sectorDisp") or r.get("sector"),
+                        "industry": r.get("industryDisp") or r.get("industry")})
     return out
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def get_info(sym):
-    info = _retry(lambda: yf.Ticker(sym).info)
-    return info if isinstance(info, dict) else {}
+def _info_raw(sym):
+    info = yf.Ticker(sym).info
+    if not isinstance(info, dict) or len(info) < 8:
+        raise RuntimeError("Yahoo returned no company details")
+    return info
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def get_prices(sym, period="2y"):
-    df = _retry(lambda: yf.Ticker(sym).history(period=period, auto_adjust=True))
+def _fast_raw(sym):
+    fi = yf.Ticker(sym).fast_info
+    out = {}
+    for src, dst in [("lastPrice", "currentPrice"), ("marketCap", "marketCap"), ("currency", "currency"),
+                     ("yearHigh", "fiftyTwoWeekHigh"), ("yearLow", "fiftyTwoWeekLow")]:
+        try:
+            v = fi[src]
+            if v is not None:
+                out[dst] = v
+        except Exception:
+            pass
+    if not out:
+        raise RuntimeError("fast_info returned nothing")
+    return out
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _targets_raw(sym):
+    t = yf.Ticker(sym).analyst_price_targets
+    if not isinstance(t, dict) or not t:
+        raise RuntimeError("no analyst targets")
+    return t
+
+
+def get_info(sym, meta=None):
+    info = _safe(_info_raw, sym, tries=3, key="company details (info)")
+    if info:
+        return info
+    info = dict(_safe(_fast_raw, sym, default={}, key="fast_info") or {})
+    if meta:
+        info.setdefault("longName", meta.get("name"))
+        if meta.get("sector"):
+            info["sector"] = meta["sector"]
+        if meta.get("industry"):
+            info["industry"] = meta["industry"]
+    info["_partial"] = True
+    return info
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _prices_raw(sym, period):
+    df = yf.Ticker(sym).history(period=period, auto_adjust=True)
     if df is None or len(df) == 0 or "Close" not in df:
-        return pd.Series(dtype=float)
+        raise RuntimeError(f"no price history for {sym}")
     s = df["Close"].dropna()
     s.index = pd.to_datetime(s.index).tz_localize(None).normalize()
     return s[~s.index.duplicated(keep="last")]
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_peers(industry_key, sym, n=6):
-    try:
-        df = yf.Industry(industry_key).top_companies
-        return [s for s in df.index if s != sym][:n]
-    except Exception:
-        return []
+def get_prices(sym, period="2y"):
+    s = _safe(_prices_raw, sym, period, key=f"prices {sym}")
+    return s if s is not None else pd.Series(dtype=float)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_calendar(sym):
-    try:
-        cal = yf.Ticker(sym).calendar
-    except Exception:
-        return {}
-    if isinstance(cal, dict):
-        return cal
+def _peers_raw(key, sym, n):
+    df = yf.Industry(key).top_companies
+    peers = [s for s in df.index if s != sym][:n]
+    if not peers:
+        raise RuntimeError("no peers")
+    return peers
+
+
+def get_peers(info, sym, n=6):
+    key = info.get("industryKey") or _slug(info.get("industry"))
+    peers = _safe(_peers_raw, key, sym, n, tries=1, key="peers") if key else None
+    if peers:
+        return peers
+    ind = (info.get("industry") or "").lower()
+    for kw, lst in PEER_FALLBACK.items():
+        if kw in ind:
+            return [p for p in lst if p != sym][:n]
+    return []
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _calendar_raw(sym):
+    cal = yf.Ticker(sym).calendar
     if isinstance(cal, pd.DataFrame) and not cal.empty:
-        return {k: list(cal.loc[k]) for k in cal.index}
-    return {}
+        cal = {k: list(cal.loc[k]) for k in cal.index}
+    if not isinstance(cal, dict) or not cal:
+        raise RuntimeError("no calendar")
+    return cal
+
+
+def get_calendar(sym):
+    return _safe(_calendar_raw, sym, default={}, tries=1, key="earnings calendar")
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
+def _earnings_raw(sym):
+    df = yf.Ticker(sym).get_earnings_dates(limit=12)
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        raise RuntimeError("no earnings history")
+    return df
+
+
 def get_earnings_history(sym):
-    df = _retry(lambda: yf.Ticker(sym).get_earnings_dates(limit=12))
-    return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+    df = _safe(_earnings_raw, sym, tries=1, key="earnings history")
+    return df if df is not None else pd.DataFrame()
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def get_news(sym):
-    raw = _retry(lambda: yf.Ticker(sym).news) or []
+def _news_raw(sym):
+    raw = yf.Ticker(sym).news or []
     out = []
     for n in raw:
         c = n.get("content", n) if isinstance(n, dict) else {}
@@ -118,13 +219,20 @@ def get_news(sym):
     return out
 
 
+def get_news(sym):
+    return _safe(_news_raw, sym, default=[], tries=1, key="news")
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
+def _isin_raw(sym):
+    v = yf.Ticker(sym).isin
+    if not v or v == "-":
+        raise RuntimeError("no ISIN")
+    return v
+
+
 def get_isin(sym):
-    try:
-        v = yf.Ticker(sym).isin
-        return v if v and v != "-" else None
-    except Exception:
-        return None
+    return _safe(_isin_raw, sym, tries=1, key="isin")
 
 
 # ------------------------------------------------------------------ calculations
@@ -396,8 +504,8 @@ def render_news(sym, name):
 
 
 # ------------------------------------------------------------------ main
-def analyse(sym, manual_peers):
-    info = get_info(sym)
+def analyse(sym, manual_peers, meta=None):
+    info = get_info(sym, meta)
     s = get_prices(sym)
     bench = get_prices(BENCH)
     if len(s) == 0:
@@ -413,8 +521,18 @@ def analyse(sym, manual_peers):
     m3.metric("Sector", info.get("sector") or "n/a")
     m4.metric("Industry", info.get("industry") or "n/a")
     st.caption(f"Last price date in data: {s.index[-1].date()}. Yahoo data is typically delayed ~15 minutes.")
+    if info.get("_partial"):
+        st.warning("Yahoo is refusing the detailed company data (P/E, targets, sector details) from this server right now. "
+                   "Prices, momentum, earnings and news may still work. Click retry in a minute or two.")
+        if st.button("Retry now"):
+            st.cache_data.clear()
+            st.rerun()
+    elif not info.get("targetMeanPrice"):
+        tg = _safe(_targets_raw, sym, tries=1, key="analyst targets")
+        if tg:
+            info["targetMeanPrice"], info["targetHighPrice"], info["targetLowPrice"] = tg.get("mean"), tg.get("high"), tg.get("low")
 
-    peers = manual_peers or (get_peers(info.get("industryKey"), sym) if info.get("industryKey") else [])
+    peers = manual_peers or get_peers(info, sym)
     with st.spinner("Comparing with peers..."):
         peers_df = pd.DataFrame([valuation_row(sym)] + [valuation_row(p) for p in peers])
     cal, hist = get_calendar(sym), get_earnings_history(sym)
@@ -442,6 +560,7 @@ def main():
 
     q = st.text_input("Company name or ticker", placeholder="e.g. Marathon Petroleum, MPC, First Solar, NDX1.DE")
     q = q.strip()
+    st.session_state["diag"] = {}
     if not q:
         st.info("Enter a name or ticker to start.")
         return
@@ -459,9 +578,17 @@ def main():
     sym = st.selectbox("Which listing?", options, format_func=lambda s: labels.get(s, s))
     peers_in = st.text_input("Optional: your own comparison tickers (comma-separated)", placeholder="e.g. VLO, PSX, DINO")
     manual = [p.strip().upper() for p in peers_in.split(",") if p.strip()] or None
-    analyse(sym, manual)
+    analyse(sym, manual, {m["symbol"]: m for m in matches}.get(sym))
 
     st.divider()
+    with st.expander("Diagnostics (open this if data is missing)"):
+        diag = st.session_state.get("diag", {})
+        st.write(f"yfinance version: {getattr(yf, '__version__', '?')}")
+        if diag:
+            for k, v in diag.items():
+                st.code(f"{k}: {v}")
+        else:
+            st.write("No data errors in this run.")
     st.caption("Data: Yahoo Finance via the open-source yfinance library. Numbers can be missing or wrong; verify anything important on the company's filings. "
                "Past performance does not predict future returns. You can lose money you invest.")
 
